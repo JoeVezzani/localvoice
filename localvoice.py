@@ -1,0 +1,496 @@
+#!/usr/bin/env python3
+"""
+LocalVoice - Talk to your computer. It types what you say.
+
+100% local. No cloud APIs. No data leaves your machine. Ever.
+
+Runs whisper.cpp on your GPU (Metal on Apple Silicon) for fast,
+accurate transcription. Just tap a key, talk, and it pastes.
+
+Two modes:
+  1. Quick:  Hold Right Option -> speak -> release to stop & transcribe
+  2. Locked: Tap Right Option -> press Space to lock open -> tap again to stop
+
+Usage:
+    python3 localvoice.py [--key alt_r] [--model PATH]
+"""
+
+import argparse
+import os
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import wave
+
+import numpy as np
+import sounddevice as sd
+from pynput import keyboard
+
+import objc
+from AppKit import (
+    NSApplication, NSApp, NSObject, NSWindow, NSView, NSColor, NSBezierPath,
+    NSBackingStoreBuffered, NSWindowStyleMaskBorderless,
+    NSFloatingWindowLevel, NSScreen, NSTimer, NSRunLoop,
+    NSRunLoopCommonModes, NSFont, NSString, NSMakeRect,
+    NSApplicationActivationPolicyAccessory,
+)
+from Quartz import CGDisplayBounds, CGMainDisplayID
+
+# --- Config ---
+SAMPLE_RATE = 16000
+CHANNELS = 1
+DTYPE = "int16"
+PILL_WIDTH = 280
+PILL_HEIGHT = 56
+PILL_MARGIN_BOTTOM = 120
+
+# --- State ---
+recording = False
+locked = False
+audio_frames = []
+stream = None
+state_lock = threading.Lock()
+last_transcription_time = 0
+COOLDOWN = 1.5
+MIN_DURATION = 0.3
+
+# Audio level for visualizer
+current_audio_level = 0.0
+audio_level_lock = threading.Lock()
+level_history = [0.0] * 32
+
+
+def _find_whisper_cli():
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    # Prefer local Metal build
+    metal = os.path.join(script_dir, "whisper-cli-metal")
+    if os.path.exists(metal):
+        return metal
+    # Check common homebrew locations
+    for path in [
+        "/opt/homebrew/bin/whisper-cli",
+        "/usr/local/bin/whisper-cli",
+    ]:
+        if os.path.exists(path):
+            return path
+    # Search homebrew cellar
+    import glob
+    matches = glob.glob("/usr/local/Cellar/whisper-cpp/*/bin/whisper-cli") + \
+              glob.glob("/opt/homebrew/Cellar/whisper-cpp/*/bin/whisper-cli")
+    if matches:
+        return sorted(matches)[-1]
+    return "whisper-cli"  # hope it's on PATH
+
+
+def _find_model():
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    models_dir = os.path.join(script_dir, "models")
+    # Prefer quantized medium (best accuracy/speed with Metal)
+    preferred = [
+        "ggml-medium.en-q5_0.bin",
+        "ggml-small.en-q5_0.bin",
+        "ggml-small.en.bin",
+        "ggml-base.en.bin",
+    ]
+    for name in preferred:
+        path = os.path.join(models_dir, name)
+        if os.path.exists(path):
+            return path
+    return os.path.join(models_dir, "ggml-base.en.bin")
+
+
+WHISPER_CLI = _find_whisper_cli()
+DEFAULT_MODEL = _find_model()
+
+
+def play_sound(sound_name="Tink"):
+    subprocess.Popen(
+        ["afplay", f"/System/Library/Sounds/{sound_name}.aiff"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+
+
+# =============================================================================
+# Floating Overlay
+# =============================================================================
+
+class WaveformView(NSView):
+    """Custom NSView that draws a waveform visualizer."""
+
+    def drawRect_(self, rect):
+        NSColor.colorWithCalibratedRed_green_blue_alpha_(0.08, 0.08, 0.12, 0.92).set()
+        pill = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+            self.bounds(), PILL_HEIGHT / 2, PILL_HEIGHT / 2
+        )
+        pill.fill()
+
+        bar_count = len(level_history)
+        bar_width = 4
+        bar_gap = 2.5
+        total_bars_width = bar_count * (bar_width + bar_gap) - bar_gap
+        start_x = (PILL_WIDTH - total_bars_width) / 2
+        center_y = PILL_HEIGHT / 2
+
+        with audio_level_lock:
+            levels = list(level_history)
+
+        for i, level in enumerate(levels):
+            x = start_x + i * (bar_width + bar_gap)
+            bar_height = max(3, level * (PILL_HEIGHT - 16))
+
+            brightness = 0.4 + 0.6 * min(level * 2, 1.0)
+            NSColor.colorWithCalibratedRed_green_blue_alpha_(
+                0.2 * brightness, 0.85 * brightness, 0.9 * brightness, 0.95
+            ).set()
+
+            bar_rect = NSMakeRect(x, center_y - bar_height / 2, bar_width, bar_height)
+            bar_path = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+                bar_rect, bar_width / 2, bar_width / 2
+            )
+            bar_path.fill()
+
+        with state_lock:
+            is_locked = locked
+            is_recording = recording
+
+        if is_recording:
+            label = "LOCKED" if is_locked else "RECORDING"
+            text_color = NSColor.colorWithCalibratedRed_green_blue_alpha_(
+                0.3, 0.9, 0.95, 0.7
+            )
+        else:
+            label = "TRANSCRIBING..."
+            text_color = NSColor.colorWithCalibratedRed_green_blue_alpha_(
+                0.9, 0.7, 0.2, 0.7
+            )
+
+        attrs = {
+            "NSFont": NSFont.systemFontOfSize_weight_(9, 0.4),
+            "NSColor": text_color,
+        }
+        ns_str = NSString.stringWithString_(label)
+        str_size = ns_str.sizeWithAttributes_(attrs)
+        ns_str.drawAtPoint_withAttributes_(
+            ((PILL_WIDTH - str_size.width) / 2, 4), attrs
+        )
+
+
+class OverlayController(NSObject):
+    """Manages the floating overlay window."""
+
+    def init(self):
+        self = objc.super(OverlayController, self).init()
+        if self is None:
+            return None
+        self._window = None
+        self._view = None
+        self._timer = None
+        self._setup_window()
+        return self
+
+    def _setup_window(self):
+        screen = NSScreen.mainScreen()
+        screen_frame = screen.frame()
+        x = (screen_frame.size.width - PILL_WIDTH) / 2
+        y = PILL_MARGIN_BOTTOM
+
+        rect = NSMakeRect(x, y, PILL_WIDTH, PILL_HEIGHT)
+        self._window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+            rect,
+            NSWindowStyleMaskBorderless,
+            NSBackingStoreBuffered,
+            False,
+        )
+        self._window.setLevel_(NSFloatingWindowLevel + 1)
+        self._window.setOpaque_(False)
+        self._window.setBackgroundColor_(NSColor.clearColor())
+        self._window.setIgnoresMouseEvents_(True)
+        self._window.setHasShadow_(True)
+        self._window.setCollectionBehavior_(1 << 4)
+
+        self._view = WaveformView.alloc().initWithFrame_(
+            NSMakeRect(0, 0, PILL_WIDTH, PILL_HEIGHT)
+        )
+        self._window.setContentView_(self._view)
+
+    def show(self):
+        self._window.orderFront_(None)
+        self._window.setAlphaValue_(1.0)
+        if not self._timer:
+            self._timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+                1.0 / 30.0, self, b"tick:", None, True
+            )
+            NSRunLoop.currentRunLoop().addTimer_forMode_(self._timer, NSRunLoopCommonModes)
+
+    def hide(self):
+        if self._timer:
+            self._timer.invalidate()
+            self._timer = None
+        self._window.orderOut_(None)
+
+    @objc.typedSelector(b"v@:@")
+    def tick_(self, timer):
+        self._view.setNeedsDisplay_(True)
+
+
+overlay = None
+
+
+# =============================================================================
+# Recording
+# =============================================================================
+
+def start_recording():
+    global recording, locked, audio_frames, stream
+
+    with state_lock:
+        if recording:
+            return False
+        if time.time() - last_transcription_time < COOLDOWN:
+            return False
+        recording = True
+        locked = False
+        audio_frames = []
+
+    with audio_level_lock:
+        for i in range(len(level_history)):
+            level_history[i] = 0.0
+
+    def callback(indata, frames, time_info, status):
+        if status:
+            print(f"  [audio status: {status}]", file=sys.stderr)
+        audio_frames.append(indata.copy())
+        rms = np.sqrt(np.mean(indata.astype(np.float32) ** 2))
+        level = min(rms / 3000.0, 1.0)
+        with audio_level_lock:
+            level_history.pop(0)
+            level_history.append(level)
+
+    stream = sd.InputStream(
+        samplerate=SAMPLE_RATE,
+        channels=CHANNELS,
+        dtype=DTYPE,
+        callback=callback,
+        blocksize=512,
+    )
+    stream.start()
+    play_sound("Tink")
+    print("  [recording...]", file=sys.stderr)
+
+    from PyObjCTools.AppHelper import callAfter
+    callAfter(overlay.show)
+    return True
+
+
+def lock_recording():
+    global locked
+    with state_lock:
+        if not recording or locked:
+            return
+        locked = True
+    play_sound("Tink")
+    print("  [locked open]", file=sys.stderr)
+
+
+def stop_recording_and_transcribe(model_path):
+    global recording, locked, stream, last_transcription_time
+
+    with state_lock:
+        if not recording:
+            return
+        recording = False
+        locked = False
+
+    if stream:
+        stream.stop()
+        stream.close()
+        stream = None
+
+    if not audio_frames:
+        print("  [no audio captured]", file=sys.stderr)
+        from PyObjCTools.AppHelper import callAfter
+        callAfter(overlay.hide)
+        return
+
+    audio_data = np.concatenate(audio_frames, axis=0)
+    duration = len(audio_data) / SAMPLE_RATE
+
+    if duration < MIN_DURATION:
+        print(f"  [too short: {duration:.1f}s, skipping]", file=sys.stderr)
+        from PyObjCTools.AppHelper import callAfter
+        callAfter(overlay.hide)
+        return
+
+    print(f"  [captured {duration:.1f}s, transcribing locally...]", file=sys.stderr)
+
+    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    try:
+        with wave.open(tmp.name, "wb") as wf:
+            wf.setnchannels(CHANNELS)
+            wf.setsampwidth(2)
+            wf.setframerate(SAMPLE_RATE)
+            wf.writeframes(audio_data.tobytes())
+
+        start = time.time()
+        env = os.environ.copy()
+        lib_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib")
+        if os.path.isdir(lib_dir):
+            env["DYLD_LIBRARY_PATH"] = lib_dir + ":" + env.get("DYLD_LIBRARY_PATH", "")
+        result = subprocess.run(
+            [WHISPER_CLI, "-m", model_path, "-f", tmp.name, "-nt", "-l", "en", "--no-prints"],
+            capture_output=True, text=True, timeout=30, env=env
+        )
+        elapsed = time.time() - start
+        text = result.stdout.strip()
+
+        from PyObjCTools.AppHelper import callAfter
+        callAfter(overlay.hide)
+
+        if not text:
+            print("  [empty transcription]", file=sys.stderr)
+            if result.stderr:
+                print(f"  [whisper stderr: {result.stderr[:200]}]", file=sys.stderr)
+            return
+
+        preview = f'"{text[:80]}..."' if len(text) > 80 else f'"{text}"'
+        print(f"  [transcribed in {elapsed:.1f}s: {preview}]", file=sys.stderr)
+
+        paste_text(text)
+        play_sound("Pop")
+        last_transcription_time = time.time()
+
+    except subprocess.TimeoutExpired:
+        print("  [transcription timed out]", file=sys.stderr)
+        play_sound("Basso")
+        from PyObjCTools.AppHelper import callAfter
+        callAfter(overlay.hide)
+    except Exception as e:
+        print(f"  [transcription error: {e}]", file=sys.stderr)
+        play_sound("Basso")
+        from PyObjCTools.AppHelper import callAfter
+        callAfter(overlay.hide)
+    finally:
+        os.unlink(tmp.name)
+
+
+def paste_text(text):
+    # Copy to clipboard
+    process = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
+    process.communicate(text.encode("utf-8"))
+    time.sleep(0.03)
+
+    # Simulate Cmd+V using compiled paste_helper binary
+    helper = os.path.join(os.path.dirname(os.path.abspath(__file__)), "paste_helper")
+    if not os.path.exists(helper):
+        print("  [paste_helper not found - text copied to clipboard, paste manually with Cmd+V]", file=sys.stderr)
+        return
+    try:
+        result = subprocess.run([helper], capture_output=True, timeout=5)
+        if result.returncode != 0:
+            stderr = result.stderr.decode().strip()
+            print(f"  [paste_helper failed: {stderr}]", file=sys.stderr)
+            print("  [text is on clipboard - paste manually with Cmd+V]", file=sys.stderr)
+    except Exception as e:
+        print(f"  [paste_helper error: {e}]", file=sys.stderr)
+
+
+# =============================================================================
+# Main
+# =============================================================================
+
+def main():
+    global overlay
+
+    parser = argparse.ArgumentParser(description="LocalVoice - talk, it types.")
+    parser.add_argument("--key", default="alt_r", help="Hotkey (default: alt_r / Right Option)")
+    parser.add_argument("--model", default=DEFAULT_MODEL, help="Path to whisper.cpp model file")
+    args = parser.parse_args()
+
+    key_map = {
+        "alt_r": keyboard.Key.alt_r,
+        "alt_l": keyboard.Key.alt_l,
+        "ctrl_r": keyboard.Key.ctrl_r,
+        "f5": keyboard.Key.f5,
+        "f6": keyboard.Key.f6,
+        "f7": keyboard.Key.f7,
+        "f8": keyboard.Key.f8,
+    }
+    hotkey = key_map.get(args.key.lower())
+    if not hotkey:
+        print(f"Unknown key: {args.key}. Options: {', '.join(key_map.keys())}")
+        sys.exit(1)
+
+    if not os.path.exists(args.model):
+        print(f"ERROR: Model not found: {args.model}")
+        print(f"Run: ./setup.sh to download a model")
+        sys.exit(1)
+
+    model_path = args.model
+
+    app = NSApplication.sharedApplication()
+    app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+
+    overlay = OverlayController.alloc().init()
+
+    model_name = os.path.basename(model_path).replace("ggml-", "").replace(".bin", "")
+    print()
+    print("   LocalVoice is ready. 100% local. No data leaves your machine.")
+    print()
+    print(f"  Hotkey:  {args.key} (Right Option)")
+    print(f"  Model:   {model_name} (whisper.cpp)")
+    print()
+    print("  How to use:")
+    print("    Hold the hotkey and talk, release to transcribe")
+    print("    Or tap to start, press Space to lock, tap again to stop")
+    print()
+    print("  Ctrl+C to quit.")
+    print()
+
+    recording_started_at = [0]
+
+    def on_press(key):
+        if key == hotkey:
+            with state_lock:
+                is_recording = recording
+            if is_recording:
+                threading.Thread(
+                    target=stop_recording_and_transcribe,
+                    args=(model_path,),
+                    daemon=True
+                ).start()
+            else:
+                if start_recording():
+                    recording_started_at[0] = time.time()
+        elif key == keyboard.Key.space:
+            with state_lock:
+                is_recording = recording
+            if is_recording:
+                lock_recording()
+
+    def on_release(key):
+        if key == hotkey:
+            with state_lock:
+                is_recording = recording
+                is_locked = locked
+            if is_recording and not is_locked and (time.time() - recording_started_at[0]) > 0.3:
+                threading.Thread(
+                    target=stop_recording_and_transcribe,
+                    args=(model_path,),
+                    daemon=True
+                ).start()
+
+    listener = keyboard.Listener(on_press=on_press, on_release=on_release)
+    listener.start()
+
+    try:
+        from PyObjCTools import AppHelper
+        AppHelper.runConsoleEventLoop()
+    except KeyboardInterrupt:
+        print("\nStopped.")
+        listener.stop()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,9 +1,12 @@
 .venv/
 models/
 lib/
+whisper-server-metal
 whisper-cli-metal
 paste_helper
 *.pyc
 __pycache__/
 voice.log
 .DS_Store
+build/
+dist/

@@ -4,18 +4,19 @@ LocalVoice - Talk to your computer. It types what you say.
 
 100% local. No cloud APIs. No data leaves your machine. Ever.
 
-Runs whisper.cpp on your GPU (Metal on Apple Silicon) for fast,
-accurate transcription. Just tap a key, talk, and it pastes.
+Architecture: whisper-server runs persistently with model loaded in GPU memory.
+Transcription happens via HTTP POST - no cold-start, ~0.4s per clip.
 
 Two modes:
   1. Quick:  Hold Right Option -> speak -> release to stop & transcribe
   2. Locked: Tap Right Option -> press Space to lock open -> tap again to stop
 
 Usage:
-    python3 localvoice.py [--key alt_r] [--model PATH]
+    python3 localvoice.py [--key alt_r] [--model small]
 """
 
 import argparse
+import math
 import os
 import subprocess
 import sys
@@ -25,12 +26,13 @@ import time
 import wave
 
 import numpy as np
+import requests
 import sounddevice as sd
 from pynput import keyboard
 
 import objc
 from AppKit import (
-    NSApplication, NSApp, NSObject, NSWindow, NSView, NSColor, NSBezierPath,
+    NSApplication, NSObject, NSWindow, NSView, NSColor, NSBezierPath,
     NSBackingStoreBuffered, NSWindowStyleMaskBorderless,
     NSFloatingWindowLevel, NSScreen, NSTimer, NSRunLoop,
     NSRunLoopCommonModes, NSFont, NSString, NSMakeRect,
@@ -42,9 +44,11 @@ from Quartz import CGDisplayBounds, CGMainDisplayID
 SAMPLE_RATE = 16000
 CHANNELS = 1
 DTYPE = "int16"
-PILL_WIDTH = 280
-PILL_HEIGHT = 56
-PILL_MARGIN_BOTTOM = 120
+PILL_WIDTH = 300
+PILL_HEIGHT = 60
+PILL_MARGIN_BOTTOM = 100
+SERVER_PORT = 8178
+SERVER_URL = f"http://127.0.0.1:{SERVER_PORT}/inference"
 
 # --- State ---
 recording = False
@@ -53,56 +57,92 @@ audio_frames = []
 stream = None
 state_lock = threading.Lock()
 last_transcription_time = 0
-COOLDOWN = 1.5
+COOLDOWN = 0.5
 MIN_DURATION = 0.3
+server_process = None
 
-# Audio level for visualizer
-current_audio_level = 0.0
+# Audio level for visualizer (updated by audio callback)
 audio_level_lock = threading.Lock()
-level_history = [0.0] * 32
+level_history = [0.0] * 40  # rolling waveform bars
+frame_count = 0  # for animations
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+MODELS = {
+    "base": os.path.join(SCRIPT_DIR, "models", "ggml-base.en.bin"),
+    "small": os.path.join(SCRIPT_DIR, "models", "ggml-small.en-q5_0.bin"),
+    "medium": os.path.join(SCRIPT_DIR, "models", "ggml-medium.en-q5_0.bin"),
+    "large": os.path.join(SCRIPT_DIR, "models", "ggml-large-v3-turbo-q5_0.bin"),
+}
 
 
-def _find_whisper_cli():
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    # Prefer local Metal build
-    metal = os.path.join(script_dir, "whisper-cli-metal")
+def _pick_default_model():
+    """Pick the best available model."""
+    for name in ["small", "medium", "base"]:
+        if os.path.exists(MODELS[name]):
+            return name
+    return "base"
+
+
+def _find_server():
+    metal = os.path.join(SCRIPT_DIR, "whisper-server-metal")
     if os.path.exists(metal):
         return metal
-    # Check common homebrew locations
     for path in [
-        "/opt/homebrew/bin/whisper-cli",
-        "/usr/local/bin/whisper-cli",
+        "/opt/homebrew/bin/whisper-server",
+        "/usr/local/bin/whisper-server",
     ]:
         if os.path.exists(path):
             return path
-    # Search homebrew cellar
-    import glob
-    matches = glob.glob("/usr/local/Cellar/whisper-cpp/*/bin/whisper-cli") + \
-              glob.glob("/opt/homebrew/Cellar/whisper-cpp/*/bin/whisper-cli")
-    if matches:
-        return sorted(matches)[-1]
-    return "whisper-cli"  # hope it's on PATH
+    return None
 
 
-def _find_model():
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    models_dir = os.path.join(script_dir, "models")
-    # Prefer quantized medium (best accuracy/speed with Metal)
-    preferred = [
-        "ggml-medium.en-q5_0.bin",
-        "ggml-small.en-q5_0.bin",
-        "ggml-small.en.bin",
-        "ggml-base.en.bin",
-    ]
-    for name in preferred:
-        path = os.path.join(models_dir, name)
-        if os.path.exists(path):
-            return path
-    return os.path.join(models_dir, "ggml-base.en.bin")
+def start_whisper_server(model_path):
+    """Start whisper-server with model loaded in GPU memory."""
+    global server_process
+
+    server_bin = _find_server()
+    if not server_bin:
+        print("ERROR: whisper-server-metal not found. Run ./setup.sh", file=sys.stderr)
+        sys.exit(1)
+
+    # Check if server already running
+    try:
+        r = requests.get(f"http://127.0.0.1:{SERVER_PORT}/", timeout=1)
+        if r.status_code == 200:
+            print("  Whisper server already running", file=sys.stderr)
+            return
+    except requests.ConnectionError:
+        pass
+
+    print("  Starting whisper server (Metal + Flash Attention)...", file=sys.stderr)
+    server_process = subprocess.Popen(
+        [server_bin, "-m", model_path, "-t", "8", "--port", str(SERVER_PORT), "-fa"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+
+    # Wait for server to be ready
+    for i in range(30):
+        time.sleep(0.5)
+        try:
+            r = requests.get(f"http://127.0.0.1:{SERVER_PORT}/", timeout=1)
+            if r.status_code == 200:
+                print(f"  Server ready (took {(i+1)*0.5:.1f}s)", file=sys.stderr)
+                return
+        except requests.ConnectionError:
+            pass
+
+    print("ERROR: Whisper server failed to start", file=sys.stderr)
+    sys.exit(1)
 
 
-WHISPER_CLI = _find_whisper_cli()
-DEFAULT_MODEL = _find_model()
+def stop_whisper_server():
+    global server_process
+    if server_process:
+        server_process.terminate()
+        server_process.wait()
+        server_process = None
 
 
 def play_sound(sound_name="Tink"):
@@ -117,18 +157,41 @@ def play_sound(sound_name="Tink"):
 # =============================================================================
 
 class WaveformView(NSView):
-    """Custom NSView that draws a waveform visualizer."""
+    """Custom NSView that draws a waveform visualizer with 60fps animations."""
 
     def drawRect_(self, rect):
-        NSColor.colorWithCalibratedRed_green_blue_alpha_(0.08, 0.08, 0.12, 0.92).set()
+        global frame_count
+        frame_count += 1
+
+        with state_lock:
+            is_locked = locked
+            is_recording = recording
+
+        # Background pill
+        if is_recording:
+            NSColor.colorWithCalibratedRed_green_blue_alpha_(0.06, 0.04, 0.12, 0.94).set()
+        else:
+            NSColor.colorWithCalibratedRed_green_blue_alpha_(0.10, 0.06, 0.04, 0.94).set()
+
         pill = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
             self.bounds(), PILL_HEIGHT / 2, PILL_HEIGHT / 2
         )
         pill.fill()
 
+        # Subtle border glow
+        if is_recording:
+            pulse = 0.3 + 0.15 * math.sin(frame_count * 0.08)
+            NSColor.colorWithCalibratedRed_green_blue_alpha_(0.4, 0.2, 1.0, pulse).set()
+        else:
+            pulse = 0.3 + 0.2 * math.sin(frame_count * 0.15)
+            NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 0.6, 0.2, pulse).set()
+        pill.setLineWidth_(1.5)
+        pill.stroke()
+
+        # Draw waveform bars
         bar_count = len(level_history)
-        bar_width = 4
-        bar_gap = 2.5
+        bar_width = 3
+        bar_gap = 2
         total_bars_width = bar_count * (bar_width + bar_gap) - bar_gap
         start_x = (PILL_WIDTH - total_bars_width) / 2
         center_y = PILL_HEIGHT / 2
@@ -138,12 +201,25 @@ class WaveformView(NSView):
 
         for i, level in enumerate(levels):
             x = start_x + i * (bar_width + bar_gap)
-            bar_height = max(3, level * (PILL_HEIGHT - 16))
 
-            brightness = 0.4 + 0.6 * min(level * 2, 1.0)
-            NSColor.colorWithCalibratedRed_green_blue_alpha_(
-                0.2 * brightness, 0.85 * brightness, 0.9 * brightness, 0.95
-            ).set()
+            if is_recording:
+                idle_wave = 0.03 * math.sin(frame_count * 0.06 + i * 0.3)
+                effective_level = max(level, abs(idle_wave))
+                bar_height = max(2, effective_level * (PILL_HEIGHT - 20))
+
+                # Purple to cyan gradient
+                t = i / max(bar_count - 1, 1)
+                r = 0.45 * (1 - t) + 0.1 * t
+                g = 0.15 * (1 - t) + 0.85 * t
+                b = 1.0 * (1 - t) + 0.95 * t
+                alpha = 0.5 + 0.5 * min(level * 3, 1.0)
+                NSColor.colorWithCalibratedRed_green_blue_alpha_(r, g, b, alpha).set()
+            else:
+                # Transcribing: warm amber wave
+                wave_offset = math.sin(frame_count * 0.12 + i * 0.2) * 0.5 + 0.5
+                bar_height = max(2, wave_offset * 12)
+                alpha = 0.4 + 0.4 * wave_offset
+                NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 0.65, 0.2, alpha).set()
 
             bar_rect = NSMakeRect(x, center_y - bar_height / 2, bar_width, bar_height)
             bar_path = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
@@ -151,20 +227,13 @@ class WaveformView(NSView):
             )
             bar_path.fill()
 
-        with state_lock:
-            is_locked = locked
-            is_recording = recording
-
+        # Status text
         if is_recording:
-            label = "LOCKED" if is_locked else "RECORDING"
-            text_color = NSColor.colorWithCalibratedRed_green_blue_alpha_(
-                0.3, 0.9, 0.95, 0.7
-            )
+            label = "LOCKED" if is_locked else "LISTENING"
+            text_color = NSColor.colorWithCalibratedRed_green_blue_alpha_(0.6, 0.4, 1.0, 0.8)
         else:
-            label = "TRANSCRIBING..."
-            text_color = NSColor.colorWithCalibratedRed_green_blue_alpha_(
-                0.9, 0.7, 0.2, 0.7
-            )
+            label = "TRANSCRIBING"
+            text_color = NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 0.7, 0.3, 0.8)
 
         attrs = {
             "NSFont": NSFont.systemFontOfSize_weight_(9, 0.4),
@@ -178,7 +247,7 @@ class WaveformView(NSView):
 
 
 class OverlayController(NSObject):
-    """Manages the floating overlay window."""
+    """Manages the floating overlay window. Draggable."""
 
     def init(self):
         self = objc.super(OverlayController, self).init()
@@ -206,9 +275,10 @@ class OverlayController(NSObject):
         self._window.setLevel_(NSFloatingWindowLevel + 1)
         self._window.setOpaque_(False)
         self._window.setBackgroundColor_(NSColor.clearColor())
-        self._window.setIgnoresMouseEvents_(True)
+        self._window.setIgnoresMouseEvents_(False)
+        self._window.setMovableByWindowBackground_(True)
         self._window.setHasShadow_(True)
-        self._window.setCollectionBehavior_(1 << 4)
+        self._window.setCollectionBehavior_(1 << 4)  # can join all spaces
 
         self._view = WaveformView.alloc().initWithFrame_(
             NSMakeRect(0, 0, PILL_WIDTH, PILL_HEIGHT)
@@ -220,7 +290,7 @@ class OverlayController(NSObject):
         self._window.setAlphaValue_(1.0)
         if not self._timer:
             self._timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
-                1.0 / 30.0, self, b"tick:", None, True
+                1.0 / 60.0, self, b"tick:", None, True
             )
             NSRunLoop.currentRunLoop().addTimer_forMode_(self._timer, NSRunLoopCommonModes)
 
@@ -294,7 +364,7 @@ def lock_recording():
     print("  [locked open]", file=sys.stderr)
 
 
-def stop_recording_and_transcribe(model_path):
+def stop_recording_and_transcribe():
     global recording, locked, stream, last_transcription_time
 
     with state_lock:
@@ -323,7 +393,7 @@ def stop_recording_and_transcribe(model_path):
         callAfter(overlay.hide)
         return
 
-    print(f"  [captured {duration:.1f}s, transcribing locally...]", file=sys.stderr)
+    print(f"  [captured {duration:.1f}s, transcribing...]", file=sys.stderr)
 
     tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
     try:
@@ -334,34 +404,38 @@ def stop_recording_and_transcribe(model_path):
             wf.writeframes(audio_data.tobytes())
 
         start = time.time()
-        env = os.environ.copy()
-        lib_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib")
-        if os.path.isdir(lib_dir):
-            env["DYLD_LIBRARY_PATH"] = lib_dir + ":" + env.get("DYLD_LIBRARY_PATH", "")
-        result = subprocess.run(
-            [WHISPER_CLI, "-m", model_path, "-f", tmp.name, "-nt", "-l", "en", "--no-prints"],
-            capture_output=True, text=True, timeout=30, env=env
+        r = requests.post(
+            SERVER_URL,
+            files={"file": ("audio.wav", open(tmp.name, "rb"), "audio/wav")},
+            data={"response_format": "json", "language": "en"},
+            timeout=15,
         )
         elapsed = time.time() - start
-        text = result.stdout.strip()
 
         from PyObjCTools.AppHelper import callAfter
         callAfter(overlay.hide)
 
+        if r.status_code != 200:
+            print(f"  [server error: {r.status_code}]", file=sys.stderr)
+            play_sound("Basso")
+            return
+
+        result = r.json()
+        text = result.get("text", "").strip()
+        text = " ".join(text.split())
+
         if not text:
             print("  [empty transcription]", file=sys.stderr)
-            if result.stderr:
-                print(f"  [whisper stderr: {result.stderr[:200]}]", file=sys.stderr)
             return
 
         preview = f'"{text[:80]}..."' if len(text) > 80 else f'"{text}"'
-        print(f"  [transcribed in {elapsed:.1f}s: {preview}]", file=sys.stderr)
+        print(f"  [{elapsed:.2f}s: {preview}]", file=sys.stderr)
 
         paste_text(text)
         play_sound("Pop")
         last_transcription_time = time.time()
 
-    except subprocess.TimeoutExpired:
+    except requests.Timeout:
         print("  [transcription timed out]", file=sys.stderr)
         play_sound("Basso")
         from PyObjCTools.AppHelper import callAfter
@@ -376,22 +450,20 @@ def stop_recording_and_transcribe(model_path):
 
 
 def paste_text(text):
-    # Copy to clipboard
     process = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
     process.communicate(text.encode("utf-8"))
-    time.sleep(0.03)
+    time.sleep(0.01)
 
-    # Simulate Cmd+V using compiled paste_helper binary
-    helper = os.path.join(os.path.dirname(os.path.abspath(__file__)), "paste_helper")
+    helper = os.path.join(SCRIPT_DIR, "paste_helper")
     if not os.path.exists(helper):
-        print("  [paste_helper not found - text copied to clipboard, paste manually with Cmd+V]", file=sys.stderr)
+        print("  [paste_helper not found - text on clipboard, paste with Cmd+V]", file=sys.stderr)
         return
     try:
         result = subprocess.run([helper], capture_output=True, timeout=5)
         if result.returncode != 0:
             stderr = result.stderr.decode().strip()
             print(f"  [paste_helper failed: {stderr}]", file=sys.stderr)
-            print("  [text is on clipboard - paste manually with Cmd+V]", file=sys.stderr)
+            print("  [text is on clipboard - paste with Cmd+V]", file=sys.stderr)
     except Exception as e:
         print(f"  [paste_helper error: {e}]", file=sys.stderr)
 
@@ -404,9 +476,13 @@ def main():
     global overlay
 
     parser = argparse.ArgumentParser(description="LocalVoice - talk, it types.")
-    parser.add_argument("--key", default="alt_r", help="Hotkey (default: alt_r / Right Option)")
-    parser.add_argument("--model", default=DEFAULT_MODEL, help="Path to whisper.cpp model file")
+    parser.add_argument("--key", default="alt_r",
+                        help="Hotkey (default: alt_r / Right Option)")
+    parser.add_argument("--model", default=None, choices=MODELS.keys(),
+                        help="Model: base, small (default, fast), medium (best accuracy), large")
     args = parser.parse_args()
+
+    model_name = args.model or _pick_default_model()
 
     key_map = {
         "alt_r": keyboard.Key.alt_r,
@@ -422,31 +498,28 @@ def main():
         print(f"Unknown key: {args.key}. Options: {', '.join(key_map.keys())}")
         sys.exit(1)
 
-    if not os.path.exists(args.model):
-        print(f"ERROR: Model not found: {args.model}")
-        print(f"Run: ./setup.sh to download a model")
+    model_path = MODELS[model_name]
+    if not os.path.exists(model_path):
+        print(f"ERROR: Model not found: {model_path}")
+        print("Run ./setup.sh to download models")
         sys.exit(1)
 
-    model_path = args.model
+    # Start persistent whisper server
+    start_whisper_server(model_path)
 
+    # Set up macOS app (needed for overlay window)
     app = NSApplication.sharedApplication()
     app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
 
     overlay = OverlayController.alloc().init()
 
-    model_name = os.path.basename(model_path).replace("ggml-", "").replace(".bin", "")
-    print()
-    print("   LocalVoice is ready. 100% local. No data leaves your machine.")
-    print()
-    print(f"  Hotkey:  {args.key} (Right Option)")
-    print(f"  Model:   {model_name} (whisper.cpp)")
-    print()
-    print("  How to use:")
-    print("    Hold the hotkey and talk, release to transcribe")
-    print("    Or tap to start, press Space to lock, tap again to stop")
-    print()
-    print("  Ctrl+C to quit.")
-    print()
+    print(f"\n  LocalVoice is ready. 100% local - Metal GPU accelerated.\n")
+    print(f"  Model: {model_name} (server mode, model stays in GPU memory)")
+    print(f"  Hotkey: {args.key}\n")
+    print(f"  Hold {args.key} and talk, release to transcribe.")
+    print(f"  Or tap to start, press Space to lock, tap again to stop.")
+    print(f"  The pill is draggable - move it wherever you want.")
+    print(f"  Ctrl+C to quit.\n")
 
     recording_started_at = [0]
 
@@ -457,7 +530,6 @@ def main():
             if is_recording:
                 threading.Thread(
                     target=stop_recording_and_transcribe,
-                    args=(model_path,),
                     daemon=True
                 ).start()
             else:
@@ -477,7 +549,6 @@ def main():
             if is_recording and not is_locked and (time.time() - recording_started_at[0]) > 0.3:
                 threading.Thread(
                     target=stop_recording_and_transcribe,
-                    args=(model_path,),
                     daemon=True
                 ).start()
 
@@ -488,8 +559,10 @@ def main():
         from PyObjCTools import AppHelper
         AppHelper.runConsoleEventLoop()
     except KeyboardInterrupt:
-        print("\nStopped.")
+        print("\nStopping server...")
+        stop_whisper_server()
         listener.stop()
+        print("Done.")
 
 
 if __name__ == "__main__":

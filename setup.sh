@@ -9,36 +9,38 @@ echo ""
 DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$DIR"
 
+# --- Check prerequisites ---
+if ! command -v python3 &>/dev/null; then
+    echo "  ERROR: python3 not found. Install Python 3.10+ first."
+    exit 1
+fi
+
+if ! command -v swiftc &>/dev/null; then
+    echo "  ERROR: Xcode Command Line Tools not found."
+    echo "  Run: xcode-select --install"
+    exit 1
+fi
+
 # --- Python venv ---
 echo "[1/4] Setting up Python environment..."
 if [ ! -d ".venv" ]; then
     python3 -m venv .venv
 fi
 source .venv/bin/activate
-pip install -q pynput sounddevice numpy pyobjc-core pyobjc-framework-Cocoa pyobjc-framework-Quartz pyobjc-framework-ApplicationServices
+pip install -q --upgrade pip
+pip install -q pynput sounddevice numpy requests \
+    pyobjc-core pyobjc-framework-Cocoa pyobjc-framework-Quartz \
+    pyobjc-framework-ApplicationServices
 
 # --- Compile paste_helper ---
 echo "[2/4] Compiling paste_helper..."
 swiftc paste_helper.swift -o paste_helper -framework Cocoa -framework ApplicationServices 2>/dev/null
 codesign --force --sign - --identifier "com.localvoice.paste-helper" paste_helper 2>/dev/null
 
-# --- Download whisper model ---
-echo "[3/4] Downloading whisper model..."
-mkdir -p models
-MODEL="models/ggml-base.en.bin"
-if [ ! -f "$MODEL" ]; then
-    curl -L --progress-bar \
-        "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin" \
-        -o "$MODEL"
-    echo "  Downloaded base.en model (148 MB)"
-else
-    echo "  Model already exists, skipping"
-fi
-
-# --- Build whisper-cpp with Metal ---
-echo "[4/4] Building whisper-cpp with Metal GPU acceleration..."
-if [ -f "whisper-cli-metal" ]; then
-    echo "  whisper-cli-metal already exists, skipping"
+# --- Build whisper-cpp with Metal (server + cli) ---
+echo "[3/4] Building whisper-cpp with Metal GPU acceleration..."
+if [ -f "whisper-server-metal" ]; then
+    echo "  whisper-server-metal already exists, skipping build"
 else
     # Check for cmake
     CMAKE=""
@@ -56,13 +58,12 @@ else
     echo "  Cloning whisper.cpp..."
     git clone --depth 1 https://github.com/ggml-org/whisper.cpp.git "$TMPDIR/whisper.cpp" 2>/dev/null
 
-    echo "  Building with Metal support (this takes ~1 min)..."
+    echo "  Building with Metal support (this takes ~2 min)..."
     ARCH=$(uname -m)
     if [ "$ARCH" = "arm64" ]; then
         $CMAKE -B "$TMPDIR/whisper.cpp/build" -S "$TMPDIR/whisper.cpp" \
             -DGGML_METAL=ON -DCMAKE_BUILD_TYPE=Release 2>/dev/null
     else
-        # Cross-compile for arm64 on x86 (Rosetta)
         $CMAKE -B "$TMPDIR/whisper.cpp/build" -S "$TMPDIR/whisper.cpp" \
             -DGGML_METAL=ON -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_OSX_ARCHITECTURES=arm64 -DGGML_NATIVE=OFF 2>/dev/null
@@ -71,38 +72,69 @@ else
     $CMAKE --build "$TMPDIR/whisper.cpp/build" --config Release \
         -j$(sysctl -n hw.ncpu) 2>/dev/null
 
-    cp "$TMPDIR/whisper.cpp/build/bin/whisper-cli" whisper-cli-metal
+    # Copy server binary (persistent mode, much faster)
+    if [ -f "$TMPDIR/whisper.cpp/build/bin/whisper-server" ]; then
+        cp "$TMPDIR/whisper.cpp/build/bin/whisper-server" whisper-server-metal
+        echo "  Built whisper-server-metal (server mode)"
+    fi
+
+    # Copy CLI binary as fallback
+    if [ -f "$TMPDIR/whisper.cpp/build/bin/whisper-cli" ]; then
+        cp "$TMPDIR/whisper.cpp/build/bin/whisper-cli" whisper-cli-metal
+    fi
 
     # Copy shared libraries
     mkdir -p lib
     find "$TMPDIR/whisper.cpp/build" -name "*.dylib" -exec cp {} lib/ \; 2>/dev/null
 
     rm -rf "$TMPDIR"
-    echo "  Built whisper-cli-metal with GPU acceleration"
+    echo "  Done! GPU acceleration enabled."
 fi
 
-# --- Upgrade model if Metal is available ---
-if [ -f "whisper-cli-metal" ]; then
+# --- Download whisper models ---
+echo "[4/4] Downloading whisper models..."
+mkdir -p models
+
+# Always grab the base model (small, fast fallback)
+BASE="models/ggml-base.en.bin"
+if [ ! -f "$BASE" ]; then
+    echo "  Downloading base.en model (148 MB)..."
+    curl -L --progress-bar \
+        "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin" \
+        -o "$BASE"
+fi
+
+# Download small quantized (best speed/accuracy balance, default)
+SMALL="models/ggml-small.en-q5_0.bin"
+if [ ! -f "$SMALL" ]; then
+    echo "  Downloading small.en quantized model (175 MB)..."
+    curl -L --progress-bar \
+        "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en-q5_0.bin" \
+        -o "$SMALL"
+fi
+
+# If Metal build succeeded, also grab medium quantized for best accuracy
+if [ -f "whisper-server-metal" ]; then
     MEDIUM="models/ggml-medium.en-q5_0.bin"
     if [ ! -f "$MEDIUM" ]; then
-        echo ""
-        echo "  Metal build detected! Downloading medium quantized model for better accuracy..."
+        echo "  Downloading medium.en quantized model (539 MB) for best accuracy..."
         curl -L --progress-bar \
             "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.en-q5_0.bin" \
             -o "$MEDIUM"
-        echo "  Downloaded medium.en-q5_0 model (539 MB)"
-        echo "  With Metal: ~1.5s transcription. Without: ~8s. Big difference."
     fi
 fi
 
 echo ""
 echo "  Setup complete!"
 echo ""
-echo "  Before first run, grant these permissions in System Settings > Privacy & Security:"
+echo "  IMPORTANT: Grant these permissions in System Settings > Privacy & Security:"
 echo ""
-echo "    Accessibility:    $(pwd)/paste_helper"
-echo "    Input Monitoring: Terminal (or your terminal app)"
-echo "    Microphone:       Terminal (or your terminal app)"
+echo "    1. Accessibility:    $(pwd)/paste_helper"
+echo "       (click +, press Cmd+Shift+G, paste the path above)"
+echo ""
+echo "    2. Input Monitoring: Terminal (or your terminal app)"
+echo ""
+echo "    3. Microphone:       Terminal (or your terminal app)"
 echo ""
 echo "  Then run:  ./start.sh"
 echo ""

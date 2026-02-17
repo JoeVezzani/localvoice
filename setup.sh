@@ -42,32 +42,41 @@ echo "[3/4] Building whisper-cpp with Metal GPU acceleration..."
 if [ -f "whisper-server-metal" ]; then
     echo "  whisper-server-metal already exists, skipping build"
 else
-    # Check for cmake
+    # Check for native cmake (brew preferred over pip - pip cmake can be x86 on arm64)
     CMAKE=""
-    if command -v cmake &>/dev/null; then
+    if [ -f "/opt/homebrew/bin/cmake" ]; then
+        CMAKE="/opt/homebrew/bin/cmake"
+    elif [ -f "/usr/local/bin/cmake" ] && [ "$(file /usr/local/bin/cmake | grep -c arm64)" -gt 0 ]; then
+        CMAKE="/usr/local/bin/cmake"
+    elif command -v cmake &>/dev/null; then
         CMAKE="cmake"
-    elif [ -f ".venv/bin/cmake" ]; then
-        CMAKE=".venv/bin/cmake"
-    else
-        echo "  Installing cmake..."
-        pip install -q cmake
-        CMAKE=".venv/bin/cmake"
     fi
+
+    if [ -z "$CMAKE" ]; then
+        echo "  Installing cmake via Homebrew..."
+        if command -v brew &>/dev/null; then
+            brew install --quiet cmake
+            CMAKE="$(brew --prefix)/bin/cmake"
+        else
+            echo "  Homebrew not found, falling back to pip cmake..."
+            pip install -q cmake
+            CMAKE=".venv/bin/cmake"
+        fi
+    fi
+
+    NATIVE_ARCH=$(uname -m)
+    echo "  Using cmake: $CMAKE"
+    echo "  Native arch: $NATIVE_ARCH"
 
     TMPDIR=$(mktemp -d)
     echo "  Cloning whisper.cpp..."
     git clone --depth 1 https://github.com/ggml-org/whisper.cpp.git "$TMPDIR/whisper.cpp" 2>/dev/null
 
     echo "  Building with Metal support (this takes ~2 min)..."
-    ARCH=$(uname -m)
-    if [ "$ARCH" = "arm64" ]; then
-        $CMAKE -B "$TMPDIR/whisper.cpp/build" -S "$TMPDIR/whisper.cpp" \
-            -DGGML_METAL=ON -DCMAKE_BUILD_TYPE=Release 2>/dev/null
-    else
-        $CMAKE -B "$TMPDIR/whisper.cpp/build" -S "$TMPDIR/whisper.cpp" \
-            -DGGML_METAL=ON -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_OSX_ARCHITECTURES=arm64 -DGGML_NATIVE=OFF 2>/dev/null
-    fi
+    # Always force the native architecture to avoid x86 builds from Rosetta/pip cmake
+    $CMAKE -B "$TMPDIR/whisper.cpp/build" -S "$TMPDIR/whisper.cpp" \
+        -DGGML_METAL=ON -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_OSX_ARCHITECTURES="$NATIVE_ARCH" 2>/dev/null
 
     $CMAKE --build "$TMPDIR/whisper.cpp/build" --config Release \
         -j$(sysctl -n hw.ncpu) 2>/dev/null

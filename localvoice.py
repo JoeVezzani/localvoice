@@ -44,8 +44,8 @@ from Quartz import CGDisplayBounds, CGMainDisplayID
 SAMPLE_RATE = 16000
 CHANNELS = 1
 DTYPE = "int16"
-PILL_WIDTH = 300
-PILL_HEIGHT = 60
+PILL_WIDTH = 360
+PILL_HEIGHT = 70
 PILL_MARGIN_BOTTOM = 100
 SERVER_PORT = 8178
 SERVER_URL = f"http://127.0.0.1:{SERVER_PORT}/inference"
@@ -63,14 +63,14 @@ server_process = None
 
 # Audio level for visualizer (updated by audio callback)
 audio_level_lock = threading.Lock()
-level_history = [0.0] * 40  # rolling waveform bars
+level_history = [0.0] * 50  # rolling waveform bars
 frame_count = 0  # for animations
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 MODELS = {
     "base": os.path.join(SCRIPT_DIR, "models", "ggml-base.en.bin"),
-    "small": os.path.join(SCRIPT_DIR, "models", "ggml-small.en.bin"),
+    "small": os.path.join(SCRIPT_DIR, "models", "ggml-small.en-q5_0.bin"),
     "medium": os.path.join(SCRIPT_DIR, "models", "ggml-medium.en-q5_0.bin"),
     "large": os.path.join(SCRIPT_DIR, "models", "ggml-large-v3-turbo-q5_0.bin"),
 }
@@ -192,11 +192,12 @@ class WaveformView(NSView):
 
         # Draw waveform bars
         bar_count = len(level_history)
-        bar_width = 3
+        bar_width = 4
         bar_gap = 2
         total_bars_width = bar_count * (bar_width + bar_gap) - bar_gap
         start_x = (PILL_WIDTH - total_bars_width) / 2
         center_y = PILL_HEIGHT / 2
+        max_bar_height = PILL_HEIGHT - 16
 
         with audio_level_lock:
             levels = list(level_history)
@@ -205,21 +206,23 @@ class WaveformView(NSView):
             x = start_x + i * (bar_width + bar_gap)
 
             if is_recording:
-                idle_wave = 0.03 * math.sin(frame_count * 0.06 + i * 0.3)
-                effective_level = max(level, abs(idle_wave))
-                bar_height = max(2, effective_level * (PILL_HEIGHT - 20))
+                # Amplify level aggressively so speech is very visible
+                boosted = min(level * 2.5, 1.0)
+                idle_wave = 0.04 * math.sin(frame_count * 0.06 + i * 0.3)
+                effective_level = max(boosted, abs(idle_wave))
+                bar_height = max(3, effective_level * max_bar_height)
 
                 # Purple to cyan gradient
                 t = i / max(bar_count - 1, 1)
                 r = 0.45 * (1 - t) + 0.1 * t
                 g = 0.15 * (1 - t) + 0.85 * t
                 b = 1.0 * (1 - t) + 0.95 * t
-                alpha = 0.5 + 0.5 * min(level * 3, 1.0)
+                alpha = 0.5 + 0.5 * min(boosted * 2, 1.0)
                 NSColor.colorWithCalibratedRed_green_blue_alpha_(r, g, b, alpha).set()
             else:
                 # Transcribing: warm amber wave
                 wave_offset = math.sin(frame_count * 0.12 + i * 0.2) * 0.5 + 0.5
-                bar_height = max(2, wave_offset * 12)
+                bar_height = max(3, wave_offset * 18)
                 alpha = 0.4 + 0.4 * wave_offset
                 NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 0.65, 0.2, alpha).set()
 
@@ -238,7 +241,7 @@ class WaveformView(NSView):
             text_color = NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 0.7, 0.3, 0.8)
 
         attrs = {
-            "NSFont": NSFont.systemFontOfSize_weight_(9, 0.4),
+            "NSFont": NSFont.systemFontOfSize_weight_(10, 0.4),
             "NSColor": text_color,
         }
         ns_str = NSString.stringWithString_(label)
@@ -335,7 +338,7 @@ def start_recording():
             print(f"  [audio status: {status}]", file=sys.stderr)
         audio_frames.append(indata.copy())
         rms = np.sqrt(np.mean(indata.astype(np.float32) ** 2))
-        level = min(rms / 3000.0, 1.0)
+        level = min(rms / 2200.0, 1.0)
         with audio_level_lock:
             level_history.pop(0)
             level_history.append(level)

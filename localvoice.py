@@ -119,7 +119,7 @@ def start_whisper_server(model_path):
     server_process = subprocess.Popen(
         [server_bin, "-m", model_path, "-t", "8", "--port", str(SERVER_PORT), "-fa"],
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
     )
 
     # Wait for server to be ready
@@ -146,9 +146,11 @@ def stop_whisper_server():
 
 
 def play_sound(sound_name="Tink"):
+    # Fire-and-forget with start_new_session to avoid zombie processes
     subprocess.Popen(
         ["afplay", f"/System/Library/Sounds/{sound_name}.aiff"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
     )
 
 
@@ -161,7 +163,7 @@ class WaveformView(NSView):
 
     def drawRect_(self, rect):
         global frame_count
-        frame_count += 1
+        frame_count = (frame_count + 1) % 100000  # prevent unbounded growth
 
         with state_lock:
             is_locked = locked
@@ -365,7 +367,7 @@ def lock_recording():
 
 
 def stop_recording_and_transcribe():
-    global recording, locked, stream, last_transcription_time
+    global recording, locked, stream, last_transcription_time, audio_frames
 
     with state_lock:
         if not recording:
@@ -378,13 +380,18 @@ def stop_recording_and_transcribe():
         stream.close()
         stream = None
 
-    if not audio_frames:
+    # Grab frames and immediately clear the global list to free memory
+    frames = audio_frames
+    audio_frames = []
+
+    if not frames:
         print("  [no audio captured]", file=sys.stderr)
         from PyObjCTools.AppHelper import callAfter
         callAfter(overlay.hide)
         return
 
-    audio_data = np.concatenate(audio_frames, axis=0)
+    audio_data = np.concatenate(frames, axis=0)
+    del frames  # free the individual frame references
     duration = len(audio_data) / SAMPLE_RATE
 
     if duration < MIN_DURATION:
@@ -402,14 +409,16 @@ def stop_recording_and_transcribe():
             wf.setsampwidth(2)
             wf.setframerate(SAMPLE_RATE)
             wf.writeframes(audio_data.tobytes())
+        del audio_data  # free the concatenated audio
 
         start = time.time()
-        r = requests.post(
-            SERVER_URL,
-            files={"file": ("audio.wav", open(tmp.name, "rb"), "audio/wav")},
-            data={"response_format": "json", "language": "en"},
-            timeout=15,
-        )
+        with open(tmp.name, "rb") as audio_file:
+            r = requests.post(
+                SERVER_URL,
+                files={"file": ("audio.wav", audio_file, "audio/wav")},
+                data={"response_format": "json", "language": "en"},
+                timeout=15,
+            )
         elapsed = time.time() - start
 
         from PyObjCTools.AppHelper import callAfter

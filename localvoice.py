@@ -70,7 +70,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 MODELS = {
     "base": os.path.join(SCRIPT_DIR, "models", "ggml-base.en.bin"),
-    "small": os.path.join(SCRIPT_DIR, "models", "ggml-small.en-q5_0.bin"),
+    "small": os.path.join(SCRIPT_DIR, "models", "ggml-small.en.bin"),
     "medium": os.path.join(SCRIPT_DIR, "models", "ggml-medium.en-q5_0.bin"),
     "large": os.path.join(SCRIPT_DIR, "models", "ggml-large-v3-turbo-q5_0.bin"),
 }

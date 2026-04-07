@@ -35,8 +35,8 @@ from AppKit import (
     NSApplication, NSObject, NSWindow, NSView, NSColor, NSBezierPath,
     NSBackingStoreBuffered, NSWindowStyleMaskBorderless,
     NSFloatingWindowLevel, NSScreen, NSTimer, NSRunLoop,
-    NSRunLoopCommonModes, NSFont, NSString, NSMakeRect,
-    NSApplicationActivationPolicyAccessory,
+    NSRunLoopCommonModes, NSFont, NSString, NSMakeRect, NSMakePoint,
+    NSEvent, NSApplicationActivationPolicyAccessory,
 )
 from Quartz import CGDisplayBounds, CGMainDisplayID
 
@@ -44,8 +44,8 @@ from Quartz import CGDisplayBounds, CGMainDisplayID
 SAMPLE_RATE = 16000
 CHANNELS = 1
 DTYPE = "int16"
-PILL_WIDTH = 360
-PILL_HEIGHT = 70
+PILL_WIDTH = 300
+PILL_HEIGHT = 60
 PILL_MARGIN_BOTTOM = 100
 SERVER_PORT = 8178
 SERVER_URL = f"http://127.0.0.1:{SERVER_PORT}/inference"
@@ -63,14 +63,14 @@ server_process = None
 
 # Audio level for visualizer (updated by audio callback)
 audio_level_lock = threading.Lock()
-level_history = [0.0] * 50  # rolling waveform bars
+level_history = [0.0] * 40  # rolling waveform bars
 frame_count = 0  # for animations
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 MODELS = {
     "base": os.path.join(SCRIPT_DIR, "models", "ggml-base.en.bin"),
-    "small": os.path.join(SCRIPT_DIR, "models", "ggml-small.en-q5_0.bin"),
+    "small": os.path.join(SCRIPT_DIR, "models", "ggml-small.en.bin"),
     "medium": os.path.join(SCRIPT_DIR, "models", "ggml-medium.en-q5_0.bin"),
     "large": os.path.join(SCRIPT_DIR, "models", "ggml-large-v3-turbo-q5_0.bin"),
 }
@@ -161,6 +161,12 @@ def play_sound(sound_name="Tink"):
 class WaveformView(NSView):
     """Custom NSView that draws a waveform visualizer with 60fps animations."""
 
+    def acceptsFirstMouse_(self, event):
+        return True
+
+    def mouseDown_(self, event):
+        self.window().performWindowDragWithEvent_(event)
+
     def drawRect_(self, rect):
         global frame_count
         frame_count = (frame_count + 1) % 100000  # prevent unbounded growth
@@ -192,12 +198,11 @@ class WaveformView(NSView):
 
         # Draw waveform bars
         bar_count = len(level_history)
-        bar_width = 4
+        bar_width = 3
         bar_gap = 2
         total_bars_width = bar_count * (bar_width + bar_gap) - bar_gap
         start_x = (PILL_WIDTH - total_bars_width) / 2
         center_y = PILL_HEIGHT / 2
-        max_bar_height = PILL_HEIGHT - 16
 
         with audio_level_lock:
             levels = list(level_history)
@@ -206,23 +211,21 @@ class WaveformView(NSView):
             x = start_x + i * (bar_width + bar_gap)
 
             if is_recording:
-                # Amplify level aggressively so speech is very visible
-                boosted = min(level * 2.5, 1.0)
-                idle_wave = 0.04 * math.sin(frame_count * 0.06 + i * 0.3)
-                effective_level = max(boosted, abs(idle_wave))
-                bar_height = max(3, effective_level * max_bar_height)
+                idle_wave = 0.03 * math.sin(frame_count * 0.06 + i * 0.3)
+                effective_level = max(level, abs(idle_wave))
+                bar_height = max(2, effective_level * (PILL_HEIGHT - 20))
 
-                # Purple to cyan gradient
+                # Purple to cyan gradient based on position and level
                 t = i / max(bar_count - 1, 1)
                 r = 0.45 * (1 - t) + 0.1 * t
                 g = 0.15 * (1 - t) + 0.85 * t
                 b = 1.0 * (1 - t) + 0.95 * t
-                alpha = 0.5 + 0.5 * min(boosted * 2, 1.0)
+                alpha = 0.5 + 0.5 * min(level * 3, 1.0)
                 NSColor.colorWithCalibratedRed_green_blue_alpha_(r, g, b, alpha).set()
             else:
-                # Transcribing: warm amber wave
+                # Transcribing: warm amber wave animation
                 wave_offset = math.sin(frame_count * 0.12 + i * 0.2) * 0.5 + 0.5
-                bar_height = max(3, wave_offset * 18)
+                bar_height = max(2, wave_offset * 12)
                 alpha = 0.4 + 0.4 * wave_offset
                 NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 0.65, 0.2, alpha).set()
 
@@ -241,7 +244,7 @@ class WaveformView(NSView):
             text_color = NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 0.7, 0.3, 0.8)
 
         attrs = {
-            "NSFont": NSFont.systemFontOfSize_weight_(10, 0.4),
+            "NSFont": NSFont.systemFontOfSize_weight_(9, 0.4),
             "NSColor": text_color,
         }
         ns_str = NSString.stringWithString_(label)
@@ -267,7 +270,7 @@ class OverlayController(NSObject):
     def _setup_window(self):
         screen = NSScreen.mainScreen()
         screen_frame = screen.frame()
-        x = (screen_frame.size.width - PILL_WIDTH) / 2
+        x = 20  # Bottom-left corner
         y = PILL_MARGIN_BOTTOM
 
         rect = NSMakeRect(x, y, PILL_WIDTH, PILL_HEIGHT)
@@ -281,7 +284,6 @@ class OverlayController(NSObject):
         self._window.setOpaque_(False)
         self._window.setBackgroundColor_(NSColor.clearColor())
         self._window.setIgnoresMouseEvents_(False)
-        self._window.setMovableByWindowBackground_(True)
         self._window.setHasShadow_(True)
         self._window.setCollectionBehavior_(1 << 4)  # can join all spaces
 
@@ -403,7 +405,14 @@ def stop_recording_and_transcribe():
         callAfter(overlay.hide)
         return
 
-    print(f"  [captured {duration:.1f}s, transcribing...]", file=sys.stderr)
+    # Auto-gain: if peak level is low, boost so whisper can detect speech
+    peak = np.max(np.abs(audio_data))
+    if 0 < peak < 8000:  # int16 range is 32767; 8000 ~ 24% = very quiet
+        gain = min(8000 / peak, 6.0)  # cap at 6x to avoid noise blowup
+        audio_data = np.clip(audio_data.astype(np.float32) * gain, -32767, 32767).astype(np.int16)
+        print(f"  [auto-gain: {gain:.1f}x, peak was {peak:.0f}]", file=sys.stderr)
+
+    print(f"  [captured {duration:.1f}s, peak={peak}, transcribing...]", file=sys.stderr)
 
     tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
     try:
@@ -413,6 +422,9 @@ def stop_recording_and_transcribe():
             wf.setframerate(SAMPLE_RATE)
             wf.writeframes(audio_data.tobytes())
         del audio_data  # free the concatenated audio
+
+        wav_size = os.path.getsize(tmp.name)
+        print(f"  [wav: {wav_size} bytes]", file=sys.stderr)
 
         start = time.time()
         with open(tmp.name, "rb") as audio_file:
@@ -433,7 +445,10 @@ def stop_recording_and_transcribe():
             return
 
         result = r.json()
-        text = result.get("text", "").strip()
+        raw_text = result.get("text", "")
+        print(f"  [whisper raw: {repr(raw_text[:200])}]", file=sys.stderr)
+        text = raw_text.strip()
+        text = text.replace("[BLANK_AUDIO]", "").strip()
         text = " ".join(text.split())
 
         if not text:

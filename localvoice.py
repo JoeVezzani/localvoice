@@ -63,7 +63,12 @@ server_process = None
 
 # Audio level for visualizer (updated by audio callback)
 audio_level_lock = threading.Lock()
-level_history = [0.0] * 40  # rolling waveform bars
+NUM_BARS = 60
+level_history = [0.0] * NUM_BARS  # rolling overall RMS
+freq_bars = [0.0] * NUM_BARS  # per-bar FFT magnitudes (targets)
+display_bars = [0.0] * NUM_BARS  # smoothed display values (rendered)
+peak_bars = [0.0] * NUM_BARS  # peak hold positions
+overall_level = 0.0  # current overall energy
 frame_count = 0  # for animations
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -78,7 +83,7 @@ MODELS = {
 
 def _pick_default_model():
     """Pick the best available model."""
-    for name in ["small", "medium", "base"]:
+    for name in ["medium", "small", "base"]:
         if os.path.exists(MODELS[name]):
             return name
     return "base"
@@ -197,43 +202,118 @@ class WaveformView(NSView):
         pill.stroke()
 
         # Draw waveform bars
-        bar_count = len(level_history)
+        bar_count = NUM_BARS
         bar_width = 3
-        bar_gap = 2
+        bar_gap = 1.5
         total_bars_width = bar_count * (bar_width + bar_gap) - bar_gap
         start_x = (PILL_WIDTH - total_bars_width) / 2
         center_y = PILL_HEIGHT / 2
+        max_bar_height = PILL_HEIGHT - 16
 
         with audio_level_lock:
-            levels = list(level_history)
+            targets = list(freq_bars)
+            energy = overall_level
 
-        for i, level in enumerate(levels):
+        # Smooth interpolation: fast attack, slow decay
+        for i in range(bar_count):
+            target = targets[i] if is_recording else 0.0
+            if target > display_bars[i]:
+                display_bars[i] += (target - display_bars[i]) * 0.5
+            else:
+                display_bars[i] += (target - display_bars[i]) * 0.12
+            display_bars[i] = max(0.0, display_bars[i])
+            # Peak hold
+            if display_bars[i] > peak_bars[i]:
+                peak_bars[i] = display_bars[i]
+            else:
+                peak_bars[i] *= 0.985
+
+        for i in range(bar_count):
             x = start_x + i * (bar_width + bar_gap)
 
             if is_recording:
-                idle_wave = 0.03 * math.sin(frame_count * 0.06 + i * 0.3)
-                effective_level = max(level, abs(idle_wave))
-                bar_height = max(2, effective_level * (PILL_HEIGHT - 20))
+                effective_level = display_bars[i]
+                # Subtle layered breathing when quiet
+                idle_wave = 0.03 * math.sin(frame_count * 0.04 + i * 0.25)
+                idle_wave += 0.02 * math.sin(frame_count * 0.07 + i * 0.15)
+                idle_wave += 0.015 * math.sin(frame_count * 0.11 + i * 0.4)
+                effective_level = max(effective_level, abs(idle_wave))
 
-                # Purple to cyan gradient based on position and level
+                bar_height = max(2, effective_level * max_bar_height)
+
+                # Rich gradient: deep violet -> royal blue -> cyan -> teal
                 t = i / max(bar_count - 1, 1)
-                r = 0.45 * (1 - t) + 0.1 * t
-                g = 0.15 * (1 - t) + 0.85 * t
-                b = 1.0 * (1 - t) + 0.95 * t
-                alpha = 0.5 + 0.5 * min(level * 3, 1.0)
+                if t < 0.33:
+                    t2 = t / 0.33
+                    r = 0.55 * (1 - t2) + 0.2 * t2
+                    g = 0.1 * (1 - t2) + 0.3 * t2
+                    b = 0.9 * (1 - t2) + 1.0 * t2
+                elif t < 0.66:
+                    t2 = (t - 0.33) / 0.33
+                    r = 0.2 * (1 - t2) + 0.05 * t2
+                    g = 0.3 * (1 - t2) + 0.85 * t2
+                    b = 1.0
+                else:
+                    t2 = (t - 0.66) / 0.34
+                    r = 0.05 * (1 - t2) + 0.0 * t2
+                    g = 0.85 * (1 - t2) + 0.75 * t2
+                    b = 1.0 * (1 - t2) + 0.7 * t2
+
+                alpha = 0.4 + 0.6 * min(effective_level * 2.5, 1.0)
+
+                # Glow layer (wider, softer)
+                glow_height = bar_height * 1.4
+                glow_alpha = alpha * 0.18
+                NSColor.colorWithCalibratedRed_green_blue_alpha_(r, g, b, glow_alpha).set()
+                glow_rect = NSMakeRect(x - 1, center_y - glow_height / 2, bar_width + 2, glow_height)
+                glow_path = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+                    glow_rect, (bar_width + 2) / 2, (bar_width + 2) / 2
+                )
+                glow_path.fill()
+
+                # Main bar
                 NSColor.colorWithCalibratedRed_green_blue_alpha_(r, g, b, alpha).set()
+                bar_rect = NSMakeRect(x, center_y - bar_height / 2, bar_width, bar_height)
+                bar_path = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+                    bar_rect, bar_width / 2, bar_width / 2
+                )
+                bar_path.fill()
+
+                # Peak hold dots (float above/below and slowly descend)
+                if peak_bars[i] > 0.1:
+                    peak_offset = peak_bars[i] * max_bar_height / 2
+                    dot_size = 2.0
+                    dot_alpha = min(peak_bars[i] * 1.5, 0.85)
+                    NSColor.colorWithCalibratedRed_green_blue_alpha_(r, g, b, dot_alpha).set()
+                    # Top dot
+                    dot_rect = NSMakeRect(
+                        x + (bar_width - dot_size) / 2,
+                        center_y + peak_offset + 2,
+                        dot_size, dot_size
+                    )
+                    NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+                        dot_rect, dot_size / 2, dot_size / 2
+                    ).fill()
+                    # Bottom dot (mirror)
+                    dot_rect_b = NSMakeRect(
+                        x + (bar_width - dot_size) / 2,
+                        center_y - peak_offset - 2 - dot_size,
+                        dot_size, dot_size
+                    )
+                    NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+                        dot_rect_b, dot_size / 2, dot_size / 2
+                    ).fill()
             else:
                 # Transcribing: warm amber wave animation
                 wave_offset = math.sin(frame_count * 0.12 + i * 0.2) * 0.5 + 0.5
                 bar_height = max(2, wave_offset * 12)
                 alpha = 0.4 + 0.4 * wave_offset
                 NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 0.65, 0.2, alpha).set()
-
-            bar_rect = NSMakeRect(x, center_y - bar_height / 2, bar_width, bar_height)
-            bar_path = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
-                bar_rect, bar_width / 2, bar_width / 2
-            )
-            bar_path.fill()
+                bar_rect = NSMakeRect(x, center_y - bar_height / 2, bar_width, bar_height)
+                bar_path = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+                    bar_rect, bar_width / 2, bar_width / 2
+                )
+                bar_path.fill()
 
         # Status text
         if is_recording:
@@ -332,16 +412,43 @@ def start_recording():
         audio_frames = []
 
     with audio_level_lock:
-        for i in range(len(level_history)):
+        for i in range(NUM_BARS):
             level_history[i] = 0.0
+            freq_bars[i] = 0.0
+    for i in range(NUM_BARS):
+        display_bars[i] = 0.0
+        peak_bars[i] = 0.0
 
     def callback(indata, frames, time_info, status):
+        global overall_level
         if status:
             print(f"  [audio status: {status}]", file=sys.stderr)
         audio_frames.append(indata.copy())
-        rms = np.sqrt(np.mean(indata.astype(np.float32) ** 2))
+        samples = indata[:, 0].astype(np.float32)
+        rms = np.sqrt(np.mean(samples ** 2))
         level = min(rms / 2200.0, 1.0)
+
+        # FFT for frequency-aware visualization
+        normalized = samples / 32768.0
+        fft = np.abs(np.fft.rfft(normalized))[1:]  # drop DC
+        n_fft = len(fft)
+        chunk = max(n_fft // NUM_BARS, 1)
+        bars = np.zeros(NUM_BARS)
+        for i in range(NUM_BARS):
+            lo = i * chunk
+            hi = min(lo + chunk, n_fft)
+            if lo < n_fft:
+                bars[i] = np.mean(fft[lo:hi])
+        max_bar = np.max(bars)
+        if max_bar > 0:
+            bars = bars / max_bar
+
         with audio_level_lock:
+            overall_level = level
+            energy = min(level * 3.0, 1.0)
+            for i in range(NUM_BARS):
+                # Shape from FFT * loudness, with 30% floor so all bars move
+                freq_bars[i] = float(min((bars[i] * 0.7 + 0.3) * energy, 1.0))
             level_history.pop(0)
             level_history.append(level)
 
@@ -369,6 +476,43 @@ def lock_recording():
         locked = True
     play_sound("Tink")
     print("  [locked open]", file=sys.stderr)
+
+
+import re
+
+# Spoken punctuation / formatting commands
+_REPLACEMENTS = [
+    (r'\bnew line\b', '\n'),
+    (r'\bnew paragraph\b', '\n\n'),
+    (r'\binsert period\b', '.'),
+    (r'\binsert comma\b', ','),
+    (r'\binsert question mark\b', '?'),
+    (r'\binsert exclamation mark\b', '!'),
+    (r'\binsert exclamation point\b', '!'),
+    (r'\binsert colon\b', ':'),
+    (r'\binsert semicolon\b', ';'),
+    (r'\binsert semi colon\b', ';'),
+    (r'\binsert quote\b', '"'),
+    (r'\binsert open quote\b', '"'),
+    (r'\binsert close quote\b', '"'),
+    (r'\binsert open paren\b', '('),
+    (r'\binsert close paren\b', ')'),
+    (r'\binsert hyphen\b', '-'),
+    (r'\binsert dash\b', ' -- '),
+    (r'\binsert ellipsis\b', '...'),
+    (r'\binsert space\b', ' '),
+]
+
+
+def _post_process(text):
+    """Clean up spoken punctuation and formatting commands."""
+    for pattern, replacement in _REPLACEMENTS:
+        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+    # Clean up spaces before punctuation that was just inserted
+    text = re.sub(r'\s+([.,?!:;])', r'\1', text)
+    # Clean up double spaces
+    text = re.sub(r'  +', ' ', text)
+    return text.strip()
 
 
 def stop_recording_and_transcribe():
@@ -431,7 +575,11 @@ def stop_recording_and_transcribe():
             r = requests.post(
                 SERVER_URL,
                 files={"file": ("audio.wav", audio_file, "audio/wav")},
-                data={"response_format": "json", "language": "en"},
+                data={
+                    "response_format": "json",
+                    "language": "en",
+                    "initial_prompt": "Joe Vezzani, Joan Vezzani, Jackie Vezzani, LunarCrush, FountainGlen, Laguna Niguel, Laguna Hills",
+                },
                 timeout=15,
             )
         elapsed = time.time() - start
@@ -450,6 +598,7 @@ def stop_recording_and_transcribe():
         text = raw_text.strip()
         text = text.replace("[BLANK_AUDIO]", "").strip()
         text = " ".join(text.split())
+        text = _post_process(text)
 
         if not text:
             print("  [empty transcription]", file=sys.stderr)
@@ -549,16 +698,30 @@ def main():
     print(f"  Ctrl+C to quit.\n")
 
     recording_started_at = [0]
+    key_held = [False]  # suppress macOS key repeat
+    stop_initiated = [False]  # prevent double-stop from press+release
+    _transcription_lock = threading.Lock()  # only one transcription at a time
+
+    def _safe_stop():
+        """Wrapper that ensures only one transcription runs at a time."""
+        if not _transcription_lock.acquire(blocking=False):
+            return  # another transcription already in progress
+        try:
+            stop_recording_and_transcribe()
+        finally:
+            _transcription_lock.release()
 
     def on_press(key):
         if key == hotkey:
+            if key_held[0]:  # ignore key repeat events
+                return
+            key_held[0] = True
+            stop_initiated[0] = False
             with state_lock:
                 is_recording = recording
             if is_recording:
-                threading.Thread(
-                    target=stop_recording_and_transcribe,
-                    daemon=True
-                ).start()
+                stop_initiated[0] = True  # on_press handled stop, skip on_release
+                threading.Thread(target=_safe_stop, daemon=True).start()
             else:
                 if start_recording():
                     recording_started_at[0] = time.time()
@@ -570,14 +733,15 @@ def main():
 
     def on_release(key):
         if key == hotkey:
+            key_held[0] = False
+            if stop_initiated[0]:  # on_press already handled the stop
+                stop_initiated[0] = False
+                return
             with state_lock:
                 is_recording = recording
                 is_locked = locked
             if is_recording and not is_locked and (time.time() - recording_started_at[0]) > 0.3:
-                threading.Thread(
-                    target=stop_recording_and_transcribe,
-                    daemon=True
-                ).start()
+                threading.Thread(target=_safe_stop, daemon=True).start()
 
     listener = keyboard.Listener(on_press=on_press, on_release=on_release)
     listener.start()
